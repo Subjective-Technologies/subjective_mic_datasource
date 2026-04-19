@@ -1,0 +1,26 @@
+[project]
+name = "subjective_mic_datasource"
+description = "Subjective v2 datasource: microphone listener with Whisper transcription."
+readme = "README.md"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "subjective-abstract-data-source-package @ git+https://github.com/Subjective-Technologies/subjective-abstract-data-source-package.git",
+    "brainboost-data-source-logger-package @ git+https://github.com/Subjective-Technologies/brainboost_data_source_logger_package.git",
+    "brainboost-configuration-package @ git+https://github.com/Subjective-Technologies/brainboost_configuration_package.git",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+    "openai-whisper>=20231117",
+    "pydub>=0.25.1",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
