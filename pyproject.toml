@@ -9,6 +9,7 @@ dependencies = [
     "brainboost-data-source-logger-package @ git+https://github.com/Subjective-Technologies/brainboost_data_source_logger_package.git",
     "brainboost-configuration-package @ git+https://github.com/Subjective-Technologies/brainboost_configuration_package.git",
     "sounddevice>=0.4.6",
+    "soundcard>=0.4.3",
     "numpy>=1.24",
     "openai-whisper>=20231117",
     "pydub>=0.25.1",

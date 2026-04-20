@@ -54,6 +54,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
 
         self.do_not_keep_audio = bool(conn.get("do_not_keep_audio", True))
         self.audio_format = (conn.get("audio_format") or "mp3").lower()
+        self.capture_speaker = bool(conn.get("capture_speaker", True))
 
         self.whisper_model = None
         self._ffmpeg_path = None
@@ -142,6 +143,18 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
                 "default": True,
                 "required": False,
             },
+            "capture_speaker": {
+                "type": "bool",
+                "label": "Also Capture Speaker Output",
+                "description": (
+                    "When checked, the system speaker output is captured via a "
+                    "loopback device and transcribed alongside the microphone. "
+                    "Each event carries a 'source' field ('microphone' or "
+                    "'speaker') so you can tell them apart."
+                ),
+                "default": True,
+                "required": False,
+            },
         }
 
     @classmethod
@@ -155,6 +168,11 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             "datasource": {"type": "text", "label": "Datasource Class"},
             "plugin": {"type": "text", "label": "Plugin"},
             "connection_name": {"type": "text", "label": "Connection"},
+            "source": {
+                "type": "text",
+                "label": "Source",
+                "description": "'microphone' for local mic input, 'speaker' for system loopback.",
+            },
             "utterance_id": {"type": "text", "label": "Utterance ID"},
             "timestamp": {
                 "type": "text",
@@ -213,6 +231,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             "datasource": self.__class__.__name__,
             "plugin": "subjective_mic_datasource",
             "connection_name": getattr(self, "connection_name", "") or "",
+            "source": "microphone",
             "utterance_id": "",
             "timestamp": now,
             "spoken_start_at": now,
@@ -247,17 +266,65 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             raise
 
     def _iter_utterances(self, one_shot: bool):
+        event_q: queue.Queue = queue.Queue()
+        whisper_lock = threading.Lock()
+        worker_stop = threading.Event()
+
+        def mic_worker():
+            try:
+                self._mic_vad_loop(event_q, whisper_lock, worker_stop, one_shot)
+            except Exception as e:
+                BBLogger.log(f"[Mic] mic worker crashed: {e}")
+                logging.exception("Mic worker error")
+
+        def speaker_worker():
+            try:
+                self._speaker_vad_loop(event_q, whisper_lock, worker_stop, one_shot)
+            except Exception as e:
+                BBLogger.log(f"[Mic] speaker worker crashed: {e}")
+                logging.exception("Speaker worker error")
+
+        threads: list[threading.Thread] = []
+        t_mic = threading.Thread(target=mic_worker, name="MicVAD", daemon=True)
+        t_mic.start()
+        threads.append(t_mic)
+
+        if self.capture_speaker:
+            t_spk = threading.Thread(target=speaker_worker, name="SpeakerVAD", daemon=True)
+            t_spk.start()
+            threads.append(t_spk)
+            BBLogger.log("[Mic] Speaker loopback capture enabled")
+        else:
+            BBLogger.log("[Mic] Speaker loopback capture disabled")
+
+        try:
+            while not self._stop_event.is_set():
+                if all(not t.is_alive() for t in threads) and event_q.empty():
+                    break
+                try:
+                    event = event_q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    continue
+                yield event
+                if one_shot:
+                    return
+        finally:
+            worker_stop.set()
+
+    def _mic_vad_loop(self, event_q, whisper_lock, worker_stop, one_shot):
         try:
             import sounddevice as sd
         except Exception as e:
             BBLogger.log(f"[Mic] sounddevice unavailable: {e}")
-            raise
+            return
 
         audio_q: queue.Queue = queue.Queue()
 
         def callback(indata, frames, time_info, status):
             if status:
-                BBLogger.log(f"[Mic] stream status: {status}")
+                BBLogger.log(f"[Mic] mic stream status: {status}")
             audio_q.put(indata.copy())
 
         stream_kwargs = dict(
@@ -270,52 +337,90 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         if self.device_index is not None:
             stream_kwargs["device"] = self.device_index
 
+        def block_iter():
+            with sd.InputStream(**stream_kwargs):
+                while not self._stop_event.is_set() and not worker_stop.is_set():
+                    try:
+                        yield audio_q.get(timeout=0.25).reshape(-1)
+                    except queue.Empty:
+                        continue
+
+        self._run_vad("microphone", block_iter(), event_q, whisper_lock, worker_stop, one_shot)
+
+    def _speaker_vad_loop(self, event_q, whisper_lock, worker_stop, one_shot):
+        try:
+            import soundcard as sc
+        except Exception as e:
+            BBLogger.log(f"[Mic] soundcard unavailable — speaker capture disabled: {e}")
+            return
+
+        try:
+            speaker = sc.default_speaker()
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            BBLogger.log(f"[Mic] Speaker loopback resolved: {speaker.name}")
+        except Exception as e:
+            BBLogger.log(f"[Mic] Could not open speaker loopback: {e}")
+            return
+
+        def block_iter():
+            try:
+                with loopback.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCK_SAMPLES) as rec:
+                    while not self._stop_event.is_set() and not worker_stop.is_set():
+                        data = rec.record(numframes=BLOCK_SAMPLES)
+                        if data is None:
+                            continue
+                        flat = data.mean(axis=1) if data.ndim > 1 else data
+                        yield flat.astype(np.float32, copy=False)
+            except Exception as e:
+                BBLogger.log(f"[Mic] Speaker recorder error: {e}")
+
+        self._run_vad("speaker", block_iter(), event_q, whisper_lock, worker_stop, one_shot)
+
+    def _run_vad(self, source: str, block_iter, event_q, whisper_lock, worker_stop, one_shot):
         utterance: list[np.ndarray] = []
         silent_blocks = 0
         in_speech = False
         silence_blocks_needed = max(1, int(self.silence_duration * 1000 / BLOCK_MS))
         max_blocks = max(1, int(self.max_utterance_duration * 1000 / BLOCK_MS))
 
-        with sd.InputStream(**stream_kwargs):
-            while not self._stop_event.is_set():
-                try:
-                    block = audio_q.get(timeout=0.5)
-                except queue.Empty:
+        for block in block_iter:
+            if self._stop_event.is_set() or worker_stop.is_set():
+                break
+
+            flat = block.reshape(-1)
+            rms = float(np.sqrt(np.mean(flat * flat))) if flat.size else 0.0
+
+            if rms > self.silence_threshold:
+                if not in_speech:
+                    in_speech = True
+                utterance.append(flat)
+                silent_blocks = 0
+            elif in_speech:
+                utterance.append(flat)
+                silent_blocks += 1
+
+            force_flush = in_speech and len(utterance) >= max_blocks
+            silence_flush = in_speech and silent_blocks >= silence_blocks_needed
+
+            if force_flush or silence_flush:
+                audio = np.concatenate(utterance) if utterance else np.zeros(0, dtype=np.float32)
+                utterance = []
+                silent_blocks = 0
+                in_speech = False
+
+                duration = len(audio) / SAMPLE_RATE
+                if duration < self.min_utterance_duration:
                     continue
 
-                flat = block.reshape(-1)
-                rms = float(np.sqrt(np.mean(flat * flat))) if flat.size else 0.0
+                flush_at = datetime.now()
+                with whisper_lock:
+                    event = self._process_utterance(audio, duration, flush_at, source)
+                if event:
+                    event_q.put(event)
+                    if one_shot:
+                        return
 
-                if rms > self.silence_threshold:
-                    if not in_speech:
-                        in_speech = True
-                    utterance.append(flat)
-                    silent_blocks = 0
-                elif in_speech:
-                    utterance.append(flat)
-                    silent_blocks += 1
-
-                force_flush = in_speech and len(utterance) >= max_blocks
-                silence_flush = in_speech and silent_blocks >= silence_blocks_needed
-
-                if force_flush or silence_flush:
-                    audio = np.concatenate(utterance) if utterance else np.zeros(0, dtype=np.float32)
-                    utterance = []
-                    silent_blocks = 0
-                    in_speech = False
-
-                    duration = len(audio) / SAMPLE_RATE
-                    if duration < self.min_utterance_duration:
-                        continue
-
-                    flush_at = datetime.now()
-                    event = self._process_utterance(audio, duration, flush_at)
-                    if event:
-                        yield event
-                        if one_shot:
-                            return
-
-    def _process_utterance(self, audio: np.ndarray, duration: float, flush_at: datetime):
+    def _process_utterance(self, audio: np.ndarray, duration: float, flush_at: datetime, source: str = "microphone"):
         try:
             transcript, language = self._transcribe(audio)
             transcribed_at = datetime.now()
@@ -326,7 +431,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
 
             audio_path = ""
             if not self.do_not_keep_audio:
-                audio_path = self._save_audio(audio)
+                audio_path = self._save_audio(audio, source)
 
             # The VAD flushes after `silence_duration` of trailing silence,
             # so the speaker stopped talking ~that long before flush_at.
@@ -337,7 +442,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             transcription_seconds = (transcribed_at - flush_at).total_seconds()
 
             timestamp = spoken_end_dt.isoformat()
-            digest_src = f"{timestamp}|{transcript}".encode("utf-8")
+            digest_src = f"{timestamp}|{source}|{transcript}".encode("utf-8")
             utterance_id = hashlib.md5(digest_src).hexdigest()[:12]
 
             return {
@@ -345,6 +450,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
                 "datasource": self.__class__.__name__,
                 "plugin": "subjective_mic_datasource",
                 "connection_name": getattr(self, "connection_name", "") or "",
+                "source": source,
                 "utterance_id": utterance_id,
                 "timestamp": timestamp,
                 "spoken_start_at": spoken_start_dt.isoformat(),
@@ -387,7 +493,7 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         BBLogger.log(f"[Mic] Loading Whisper model '{self.whisper_model_size}'")
         self.whisper_model = whisper.load_model(self.whisper_model_size)
 
-    def _save_audio(self, audio: np.ndarray) -> str:
+    def _save_audio(self, audio: np.ndarray, source: str = "microphone") -> str:
         tmp_dir = self._get_audio_dir()
         os.makedirs(tmp_dir, exist_ok=True)
 
@@ -397,12 +503,12 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
 
         fmt = self.audio_format
         if fmt == "mp3":
-            path = os.path.join(tmp_dir, f"utterance_{ts}.mp3")
+            path = os.path.join(tmp_dir, f"utterance_{source}_{ts}.mp3")
             if self._export_mp3(int16, path):
                 return path
             fmt = "wav"
 
-        path = os.path.join(tmp_dir, f"utterance_{ts}.wav")
+        path = os.path.join(tmp_dir, f"utterance_{source}_{ts}.wav")
         self._export_wav(int16, path)
         return path
 
