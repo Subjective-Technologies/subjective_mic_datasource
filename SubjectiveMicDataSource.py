@@ -329,7 +329,12 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
 
     def stream(self, request: dict):
         """Listen to the mic indefinitely, yielding one dict per transcribed utterance."""
-        self._load_whisper_model()
+        try:
+            self._load_whisper_model()
+        except Exception as e:
+            BBLogger.log(f"[Mic] Whisper model load failed, stream aborting: {e}")
+            logging.exception("Mic Whisper load error")
+            return
         BBLogger.log("[Mic] Streaming started — listening for utterances")
         try:
             for event in self._iter_utterances(one_shot=False):
@@ -338,6 +343,11 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             self._stop_event.set()
             BBLogger.log("[Mic] Streaming stopped")
             raise
+        except Exception as e:
+            # Never let an audio-device / runtime error escape to the launcher.
+            BBLogger.log(f"[Mic] Streaming error (swallowed): {e}")
+            logging.exception("Mic stream error")
+            return
 
     def _iter_utterances(self, one_shot: bool):
         event_q: queue.Queue = queue.Queue()
@@ -395,37 +405,114 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             return
 
         audio_q: queue.Queue = queue.Queue()
+        candidate_rates = [SAMPLE_RATE, 48000, 44100, 32000, 22050]
 
-        def callback(indata, frames, time_info, status):
-            if status:
-                BBLogger.log(f"[Mic] mic stream status: {status}")
-            audio_q.put(indata.copy())
+        # Discover device default samplerate and put it first in the list.
+        try:
+            dev_info = sd.query_devices(self.device_index, "input")
+            default_rate = int(dev_info.get("default_samplerate") or 0)
+            if default_rate and default_rate not in candidate_rates:
+                candidate_rates.insert(0, default_rate)
+            BBLogger.log(
+                f"[Mic] Input device: {dev_info.get('name')!r} "
+                f"(default_rate={default_rate}, max_channels={dev_info.get('max_input_channels')})"
+            )
+        except Exception as e:
+            BBLogger.log(f"[Mic] Could not query input device: {e}")
 
-        stream_kwargs = dict(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=BLOCK_SAMPLES,
-            callback=callback,
-        )
-        if self.device_index is not None:
-            stream_kwargs["device"] = self.device_index
+        def make_callback(ratio: float):
+            def cb(indata, frames, time_info, status):
+                if status:
+                    BBLogger.log(f"[Mic] mic stream status: {status}")
+                data = indata.reshape(-1).astype(np.float32, copy=False)
+                if ratio != 1.0:
+                    new_n = max(1, int(round(len(data) * ratio)))
+                    data = np.interp(
+                        np.linspace(0, len(data) - 1, new_n, dtype=np.float32),
+                        np.arange(len(data), dtype=np.float32),
+                        data,
+                    ).astype(np.float32, copy=False)
+                audio_q.put(data.copy())
+            return cb
+
+        stream = None
+        actual_rate = None
+        last_err: Exception | None = None
+        for rate in candidate_rates:
+            bs = int(rate * BLOCK_MS / 1000)
+            ratio = SAMPLE_RATE / rate
+            try:
+                kwargs = dict(
+                    samplerate=rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=bs,
+                    callback=make_callback(ratio),
+                )
+                if self.device_index is not None:
+                    kwargs["device"] = self.device_index
+                stream = sd.InputStream(**kwargs)
+                stream.start()
+                actual_rate = rate
+                BBLogger.log(
+                    f"[Mic] Mic capture opened at {rate}Hz "
+                    f"(resample_ratio={ratio:.4f}, blocksize={bs})"
+                )
+                break
+            except Exception as e:
+                last_err = e
+                BBLogger.log(f"[Mic] InputStream open failed at {rate}Hz: {e}")
+
+        if stream is None:
+            try:
+                devices = sd.query_devices()
+                BBLogger.log(f"[Mic] Available audio devices:\n{devices}")
+            except Exception:
+                pass
+            BBLogger.log(
+                f"[Mic] Could not open any input stream. Last error: {last_err}. "
+                f"Set Input Device Index in the connection to a working device."
+            )
+            return
 
         def block_iter():
-            with sd.InputStream(**stream_kwargs):
+            try:
                 while not self._stop_event.is_set() and not worker_stop.is_set():
                     try:
-                        yield audio_q.get(timeout=0.25).reshape(-1)
+                        yield audio_q.get(timeout=0.25)
                     except queue.Empty:
                         continue
+            finally:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
+        _ = actual_rate  # kept for logging only; all blocks are resampled to 16kHz
         self._run_vad("microphone", block_iter(), event_q, whisper_lock, worker_stop, one_shot)
 
     def _speaker_vad_loop(self, event_q, whisper_lock, worker_stop, one_shot):
+        # soundcard uses WASAPI via COM on Windows; every thread that
+        # touches it must initialize COM first or we get OSError / E_FAIL.
+        com_initialized = False
+        if os.name == "nt":
+            try:
+                import ctypes
+                # COINIT_MULTITHREADED = 0x0
+                hr = ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+                # 0 = S_OK, 1 = S_FALSE (already initialized in compatible mode)
+                com_initialized = hr in (0, 1)
+                if not com_initialized:
+                    BBLogger.log(f"[Mic] CoInitializeEx returned HRESULT=0x{hr & 0xFFFFFFFF:08X}")
+            except Exception as e:
+                BBLogger.log(f"[Mic] COM init failed in speaker thread: {e}")
+
         try:
             import soundcard as sc
         except Exception as e:
             BBLogger.log(f"[Mic] soundcard unavailable — speaker capture disabled: {e}")
+            self._com_uninit(com_initialized)
             return
 
         try:
@@ -434,21 +521,66 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             BBLogger.log(f"[Mic] Speaker loopback resolved: {speaker.name}")
         except Exception as e:
             BBLogger.log(f"[Mic] Could not open speaker loopback: {e}")
+            self._com_uninit(com_initialized)
             return
 
         def block_iter():
+            rec = None
+            actual_rate = None
+            for rate in (SAMPLE_RATE, 48000, 44100, 32000):
+                try:
+                    bs = int(rate * BLOCK_MS / 1000)
+                    rec_cm = loopback.recorder(samplerate=rate, channels=1, blocksize=bs)
+                    rec = rec_cm.__enter__()
+                    actual_rate = rate
+                    BBLogger.log(f"[Mic] Speaker capture opened at {rate}Hz (blocksize={bs})")
+                    break
+                except Exception as e:
+                    BBLogger.log(f"[Mic] Speaker recorder open failed at {rate}Hz: {e}")
+                    rec = None
+            if rec is None:
+                BBLogger.log("[Mic] Could not open speaker loopback at any samplerate")
+                return
+
+            ratio = SAMPLE_RATE / actual_rate
+            block_frames = int(actual_rate * BLOCK_MS / 1000)
             try:
-                with loopback.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=BLOCK_SAMPLES) as rec:
-                    while not self._stop_event.is_set() and not worker_stop.is_set():
-                        data = rec.record(numframes=BLOCK_SAMPLES)
-                        if data is None:
-                            continue
-                        flat = data.mean(axis=1) if data.ndim > 1 else data
-                        yield flat.astype(np.float32, copy=False)
+                while not self._stop_event.is_set() and not worker_stop.is_set():
+                    data = rec.record(numframes=block_frames)
+                    if data is None:
+                        continue
+                    flat = data.mean(axis=1) if data.ndim > 1 else data
+                    flat = flat.astype(np.float32, copy=False)
+                    if ratio != 1.0:
+                        new_n = max(1, int(round(len(flat) * ratio)))
+                        flat = np.interp(
+                            np.linspace(0, len(flat) - 1, new_n, dtype=np.float32),
+                            np.arange(len(flat), dtype=np.float32),
+                            flat,
+                        ).astype(np.float32, copy=False)
+                    yield flat
             except Exception as e:
                 BBLogger.log(f"[Mic] Speaker recorder error: {e}")
+            finally:
+                try:
+                    rec_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
 
-        self._run_vad("speaker", block_iter(), event_q, whisper_lock, worker_stop, one_shot)
+        try:
+            self._run_vad("speaker", block_iter(), event_q, whisper_lock, worker_stop, one_shot)
+        finally:
+            self._com_uninit(com_initialized)
+
+    @staticmethod
+    def _com_uninit(was_initialized: bool):
+        if not was_initialized or os.name != "nt":
+            return
+        try:
+            import ctypes
+            ctypes.windll.ole32.CoUninitialize()
+        except Exception:
+            pass
 
     def _run_vad(self, source: str, block_iter, event_q, whisper_lock, worker_stop, one_shot):
         utterance: list[np.ndarray] = []
