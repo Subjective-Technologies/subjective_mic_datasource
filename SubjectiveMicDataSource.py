@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import queue
 import socket
@@ -19,6 +20,79 @@ from brainboost_data_source_logger_package.BBLogger import BBLogger
 SAMPLE_RATE = 16000
 BLOCK_MS = 100
 BLOCK_SAMPLES = SAMPLE_RATE * BLOCK_MS // 1000
+
+# Phrases Whisper hallucinates on silent / low-SNR audio because its
+# training set was heavy with YouTube outros, subtitle credits, etc.
+# Normalize (lowercase, strip punctuation) before comparing.
+_HALLUCINATION_EXACT = frozenset({
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for watching everyone",
+    "thanks for watching everybody",
+    "thanks for watching my video",
+    "thank you",
+    "thanks",
+    "thank you so much",
+    "thank you very much",
+    "thanks so much",
+    "thanks so much for watching",
+    "please subscribe",
+    "don't forget to subscribe",
+    "like and subscribe",
+    "like comment and subscribe",
+    "see you in the next video",
+    "see you next time",
+    "bye",
+    "bye bye",
+    "goodbye",
+    "okay",
+    "ok",
+    "you",
+    "uh",
+    "um",
+    "mm",
+    "hmm",
+    "music",
+    "music playing",
+    "applause",
+    "silence",
+    "ご視聴ありがとうございました",
+    "チャンネル登録お願いします",
+    "gracias por ver",
+    "gracias",
+    "merci",
+    "danke",
+})
+
+_HALLUCINATION_PREFIXES = (
+    "subtitles by",
+    "subtitled by",
+    "transcribed by",
+    "captions by",
+    "caption by",
+    "subs by",
+    "sub by",
+    "subtítulos por",
+    "subtitulado por",
+)
+
+_PUNCT_STRIP_RE = re.compile(r"^[\W_]+|[\W_]+$", flags=re.UNICODE)
+_WS_RE = re.compile(r"\s+")
+
+
+def _is_whisper_hallucination(transcript: str) -> bool:
+    if not transcript:
+        return False
+    normalized = _WS_RE.sub(" ", transcript.strip().lower())
+    stripped = _PUNCT_STRIP_RE.sub("", normalized)
+    if stripped in _HALLUCINATION_EXACT or normalized in _HALLUCINATION_EXACT:
+        return True
+    if stripped.startswith(_HALLUCINATION_PREFIXES):
+        return True
+    # Bare music/noise markers
+    if stripped in ("", "music", "applause", "laughter", "silence") or normalized in ("♪", "♪♪", "♪♪♪"):
+        return True
+    return False
 
 
 class SubjectiveMicDataSource(SubjectiveDataSource):
@@ -429,6 +503,10 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             if not transcript:
                 return None
 
+            if _is_whisper_hallucination(transcript):
+                BBLogger.log(f"[Mic] Dropped Whisper hallucination [{source}]: {transcript!r}")
+                return None
+
             audio_path = ""
             if not self.do_not_keep_audio:
                 audio_path = self._save_audio(audio, source)
@@ -480,7 +558,20 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         import torch
         if self.whisper_model is None:
             self._load_whisper_model()
-        kwargs = {"fp16": torch.cuda.is_available()}
+        kwargs = {
+            "fp16": torch.cuda.is_available(),
+            # Stop the decoder from using prior output as context — the
+            # main driver of cascading hallucinations on noisy input.
+            "condition_on_previous_text": False,
+            # If Whisper's own no-speech prob is above this, treat the
+            # segment as silence and emit nothing.
+            "no_speech_threshold": 0.6,
+            # Reject segments whose avg log-prob is below this — a
+            # strong signal the decoder was guessing.
+            "logprob_threshold": -1.0,
+            # Catch degenerate repeats ("you you you you ...").
+            "compression_ratio_threshold": 2.4,
+        }
         if self.language:
             kwargs["language"] = self.language
         result = self.whisper_model.transcribe(audio.astype(np.float32), **kwargs)
