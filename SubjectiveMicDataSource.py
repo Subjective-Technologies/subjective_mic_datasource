@@ -1,12 +1,13 @@
 import os
 import sys
-import json
-import time
 import queue
+import socket
+import getpass
 import logging
 import hashlib
+import platform
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -23,12 +24,16 @@ BLOCK_SAMPLES = SAMPLE_RATE * BLOCK_MS // 1000
 class SubjectiveMicDataSource(SubjectiveDataSource):
     """
     Listens to the microphone, segments audio into utterances using a
-    silence-based VAD, transcribes each utterance with Whisper, writes
-    the transcript to a context JSON file and emits a streaming event.
+    silence-based VAD, transcribes each utterance with Whisper and
+    yields a self-contained dict per utterance. The framework writes
+    that dict to the canonical context file
+    (YYYY_MM_DD_HH_MM_SS-Mic-[connection]-context.json) — this class
+    does not write context files itself.
 
-    The raw audio for each utterance is saved in compact form (MP3 when
-    ffmpeg is available, otherwise WAV) to the connection temp dir so
-    it can be inspected or re-transcribed, and pruned on demand.
+    By default the raw audio is discarded immediately after
+    transcription. Disable the "Do Not Keep Audio" connection toggle
+    to additionally archive the utterance as MP3 (or WAV when ffmpeg
+    is unavailable).
     """
 
     def __init__(self, **kwargs):
@@ -47,25 +52,17 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         self.min_utterance_duration = float(conn.get("min_utterance_duration") or 0.4)
         self.max_utterance_duration = float(conn.get("max_utterance_duration") or 30.0)
 
-        self.keep_audio = bool(conn.get("keep_audio", True))
+        self.do_not_keep_audio = bool(conn.get("do_not_keep_audio", True))
         self.audio_format = (conn.get("audio_format") or "mp3").lower()
-
-        default_context = os.path.join(
-            os.path.expanduser("~"),
-            ".Subjective", "com_subjective_userdata", "com_subjective_context",
-        )
-        self.context_dir = conn.get("context_dir") or default_context
 
         self.whisper_model = None
         self._ffmpeg_path = None
+        self._ffmpeg_checked = False
+        self._ffmpeg_unavailable = False
         self._stop_event = threading.Event()
 
     @classmethod
     def connection_schema(cls) -> dict:
-        default_context = os.path.join(
-            os.path.expanduser("~"),
-            ".Subjective", "com_subjective_userdata", "com_subjective_context",
-        )
         return {
             "whisper_model_size": {
                 "type": "select",
@@ -134,18 +131,15 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
                 "default": "mp3",
                 "required": False,
             },
-            "keep_audio": {
+            "do_not_keep_audio": {
                 "type": "bool",
-                "label": "Keep Audio Files",
-                "description": "When disabled, audio files are deleted after successful transcription.",
+                "label": "Do Not Keep Audio",
+                "description": (
+                    "When checked, the raw utterance audio is never written to disk — "
+                    "only the transcript survives, inside the context JSON. "
+                    "Uncheck to additionally archive the audio file next to the context."
+                ),
                 "default": True,
-                "required": False,
-            },
-            "context_dir": {
-                "type": "folder_path",
-                "label": "Context Output Directory",
-                "description": "Directory where transcription JSON files are saved.",
-                "default": default_context,
                 "required": False,
             },
         }
@@ -157,35 +151,33 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
     @classmethod
     def output_schema(cls) -> dict:
         return {
-            "transcript": {
-                "type": "textarea",
-                "label": "Transcript",
-                "description": "Transcribed text of the utterance.",
-            },
-            "audio_path": {
-                "type": "text",
-                "label": "Audio File Path",
-                "description": "Path to the saved compact audio file for this utterance.",
-            },
-            "output_path": {
-                "type": "text",
-                "label": "Context File Path",
-                "description": "Path to the JSON context file written for this utterance.",
-            },
+            "type": {"type": "text", "label": "Event Type"},
+            "datasource": {"type": "text", "label": "Datasource Class"},
+            "plugin": {"type": "text", "label": "Plugin"},
+            "connection_name": {"type": "text", "label": "Connection"},
+            "utterance_id": {"type": "text", "label": "Utterance ID"},
             "timestamp": {
                 "type": "text",
-                "label": "Timestamp",
-                "description": "ISO timestamp of when the utterance ended.",
+                "label": "Timestamp (spoken end)",
+                "description": "When the speaker stopped talking. Use this as the canonical event time.",
             },
-            "duration_seconds": {
-                "type": "number",
-                "label": "Duration (seconds)",
-                "description": "Length of the utterance in seconds.",
-            },
-            "language": {
-                "type": "text",
-                "label": "Detected Language",
-            },
+            "spoken_start_at": {"type": "text", "label": "Spoken Start"},
+            "spoken_end_at": {"type": "text", "label": "Spoken End"},
+            "transcribed_at": {"type": "text", "label": "Transcribed At"},
+            "transcription_seconds": {"type": "number", "label": "Transcription Time (seconds)"},
+            "duration_seconds": {"type": "number", "label": "Duration (seconds)"},
+            "language": {"type": "text", "label": "Detected Language"},
+            "whisper_model": {"type": "text", "label": "Whisper Model"},
+            "sample_rate": {"type": "int", "label": "Sample Rate"},
+            "channels": {"type": "int", "label": "Channels"},
+            "input_device_index": {"type": "int", "label": "Input Device Index"},
+            "hostname": {"type": "text", "label": "Hostname"},
+            "os_user": {"type": "text", "label": "OS User"},
+            "platform": {"type": "text", "label": "Platform"},
+            "audio_kept": {"type": "bool", "label": "Audio Kept"},
+            "audio_path": {"type": "text", "label": "Audio File Path"},
+            "audio_format": {"type": "text", "label": "Audio Format"},
+            "transcription": {"type": "textarea", "label": "Transcription"},
         }
 
     @classmethod
@@ -207,18 +199,40 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             self._load_whisper_model()
             for event in self._iter_utterances(one_shot=True):
                 return event
-            return {
-                "transcript": "",
-                "audio_path": "",
-                "output_path": "",
-                "timestamp": datetime.now().isoformat(),
-                "duration_seconds": 0.0,
-                "language": "",
-            }
+            return self._empty_event()
         except Exception as e:
             BBLogger.log(f"[Mic] run() error: {e}")
-            return {"error": str(e), "transcript": "", "audio_path": "", "output_path": "",
-                    "timestamp": datetime.now().isoformat(), "duration_seconds": 0.0, "language": ""}
+            event = self._empty_event()
+            event["error"] = str(e)
+            return event
+
+    def _empty_event(self) -> dict:
+        now = datetime.now().isoformat()
+        return {
+            "type": "mic_transcription",
+            "datasource": self.__class__.__name__,
+            "plugin": "subjective_mic_datasource",
+            "connection_name": getattr(self, "connection_name", "") or "",
+            "utterance_id": "",
+            "timestamp": now,
+            "spoken_start_at": now,
+            "spoken_end_at": now,
+            "transcribed_at": now,
+            "transcription_seconds": 0.0,
+            "duration_seconds": 0.0,
+            "language": "",
+            "whisper_model": self.whisper_model_size,
+            "sample_rate": SAMPLE_RATE,
+            "channels": 1,
+            "input_device_index": self.device_index,
+            "hostname": socket.gethostname(),
+            "os_user": self._safe_user(),
+            "platform": f"{platform.system()} {platform.release()}",
+            "audio_kept": False,
+            "audio_path": None,
+            "audio_format": None,
+            "transcription": "",
+        }
 
     def stream(self, request: dict):
         """Listen to the mic indefinitely, yielding one dict per transcribed utterance."""
@@ -294,43 +308,62 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
                     if duration < self.min_utterance_duration:
                         continue
 
-                    event = self._process_utterance(audio, duration)
+                    flush_at = datetime.now()
+                    event = self._process_utterance(audio, duration, flush_at)
                     if event:
                         yield event
                         if one_shot:
                             return
 
-    def _process_utterance(self, audio: np.ndarray, duration: float):
+    def _process_utterance(self, audio: np.ndarray, duration: float, flush_at: datetime):
         try:
-            audio_path = self._save_audio(audio)
             transcript, language = self._transcribe(audio)
+            transcribed_at = datetime.now()
             transcript = (transcript or "").strip()
 
             if not transcript:
-                if audio_path and not self.keep_audio:
-                    self._safe_remove(audio_path)
                 return None
 
-            timestamp = datetime.now().isoformat()
-            context_path = self._write_context_json(
-                transcript=transcript,
-                audio_path=audio_path,
-                timestamp=timestamp,
-                duration=duration,
-                language=language,
-            )
+            audio_path = ""
+            if not self.do_not_keep_audio:
+                audio_path = self._save_audio(audio)
 
-            if audio_path and not self.keep_audio:
-                self._safe_remove(audio_path)
-                audio_path = ""
+            # The VAD flushes after `silence_duration` of trailing silence,
+            # so the speaker stopped talking ~that long before flush_at.
+            # The `duration` includes that trailing silence too, so the
+            # spoken start is flush_at - duration.
+            spoken_end_dt = flush_at - timedelta(seconds=self.silence_duration)
+            spoken_start_dt = flush_at - timedelta(seconds=duration)
+            transcription_seconds = (transcribed_at - flush_at).total_seconds()
+
+            timestamp = spoken_end_dt.isoformat()
+            digest_src = f"{timestamp}|{transcript}".encode("utf-8")
+            utterance_id = hashlib.md5(digest_src).hexdigest()[:12]
 
             return {
-                "transcript": transcript,
-                "audio_path": audio_path,
-                "output_path": context_path,
+                "type": "mic_transcription",
+                "datasource": self.__class__.__name__,
+                "plugin": "subjective_mic_datasource",
+                "connection_name": getattr(self, "connection_name", "") or "",
+                "utterance_id": utterance_id,
                 "timestamp": timestamp,
+                "spoken_start_at": spoken_start_dt.isoformat(),
+                "spoken_end_at": spoken_end_dt.isoformat(),
+                "transcribed_at": transcribed_at.isoformat(),
+                "transcription_seconds": round(transcription_seconds, 3),
                 "duration_seconds": round(duration, 3),
                 "language": language or "",
+                "whisper_model": self.whisper_model_size,
+                "sample_rate": SAMPLE_RATE,
+                "channels": 1,
+                "input_device_index": self.device_index,
+                "hostname": socket.gethostname(),
+                "os_user": self._safe_user(),
+                "platform": f"{platform.system()} {platform.release()}",
+                "audio_kept": bool(audio_path),
+                "audio_path": audio_path or None,
+                "audio_format": (self.audio_format if audio_path else None),
+                "transcription": transcript,
             }
         except Exception as e:
             BBLogger.log(f"[Mic] Error processing utterance: {e}")
@@ -374,9 +407,13 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         return path
 
     def _export_mp3(self, pcm16: np.ndarray, path: str) -> bool:
+        if self._ffmpeg_unavailable:
+            return False
         try:
             from pydub import AudioSegment
             self._configure_ffmpeg()
+            if self._ffmpeg_unavailable:
+                return False
             segment = AudioSegment(
                 pcm16.tobytes(),
                 frame_rate=SAMPLE_RATE,
@@ -385,8 +422,16 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             )
             segment.export(path, format="mp3", bitrate="64k")
             return True
+        except FileNotFoundError as e:
+            self._ffmpeg_unavailable = True
+            BBLogger.log(
+                f"[Mic] MP3 export failed ({e}) — ffmpeg binary unreachable. "
+                f"Configured converter: {getattr(__import__('pydub').AudioSegment, 'converter', None)!r}. "
+                f"Switching this session to WAV."
+            )
+            return False
         except Exception as e:
-            BBLogger.log(f"[Mic] MP3 export failed ({e}) — falling back to WAV")
+            BBLogger.log(f"[Mic] MP3 export failed ({e}) — falling back to WAV for this utterance")
             return False
 
     def _export_wav(self, pcm16: np.ndarray, path: str):
@@ -404,27 +449,54 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         if self._ffmpeg_path and os.path.exists(self._ffmpeg_path):
             AudioSegment.converter = self._ffmpeg_path
             return
+        if self._ffmpeg_checked:
+            return
+        self._ffmpeg_checked = True
+
+        if os.name == "nt":
+            platform_sub = "windows"
+            exe = "ffmpeg.exe"
+        elif sys.platform == "darwin":
+            platform_sub = "mac"
+            exe = "ffmpeg"
+        else:
+            platform_sub = "linux"
+            exe = "ffmpeg"
 
         plugin_dir = os.path.dirname(__file__)
-        if os.name == "nt":
-            local = os.path.join(plugin_dir, "deps", "bin", "windows", "ffmpeg.exe")
-        elif sys.platform == "darwin":
-            local = os.path.join(plugin_dir, "deps", "bin", "mac", "ffmpeg")
-        else:
-            local = os.path.join(plugin_dir, "deps", "bin", "linux", "ffmpeg")
+        candidates = [
+            os.path.join(plugin_dir, "deps", "bin", platform_sub, exe),
+            os.path.join(
+                os.path.dirname(plugin_dir),
+                "subjective_transcribelocalvideo_datasource",
+                "deps", "bin", platform_sub, exe,
+            ),
+        ]
 
-        if os.path.exists(local):
-            AudioSegment.converter = local
-            self._ffmpeg_path = local
-            return
+        for c in candidates:
+            if os.path.exists(c):
+                AudioSegment.converter = c
+                self._ffmpeg_path = c
+                BBLogger.log(f"[Mic] ffmpeg resolved (local deps): {c}")
+                return
 
         env_path = os.getenv("FFMPEG_PATH") or os.getenv("FFMPEG_BINARY")
-        if env_path and os.path.exists(env_path):
-            AudioSegment.converter = env_path
-            self._ffmpeg_path = env_path
-            return
+        if env_path:
+            candidate = env_path
+            if os.path.isdir(candidate):
+                candidate = os.path.join(candidate, exe)
+            if os.path.exists(candidate):
+                AudioSegment.converter = candidate
+                self._ffmpeg_path = candidate
+                BBLogger.log(f"[Mic] ffmpeg resolved (env): {candidate}")
+                return
+            BBLogger.log(f"[Mic] FFMPEG_PATH/FFMPEG_BINARY set but not found: {env_path}")
 
-        if which("ffmpeg"):
+        resolved = which("ffmpeg")
+        if resolved and os.path.exists(resolved):
+            AudioSegment.converter = resolved
+            self._ffmpeg_path = resolved
+            BBLogger.log(f"[Mic] ffmpeg resolved (PATH): {resolved}")
             return
 
         try:
@@ -433,30 +505,28 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
             if path and os.path.exists(path):
                 AudioSegment.converter = path
                 self._ffmpeg_path = path
+                BBLogger.log(f"[Mic] ffmpeg resolved (imageio-ffmpeg): {path}")
+                return
+            BBLogger.log(f"[Mic] imageio-ffmpeg returned unusable path: {path!r}")
+        except ImportError:
+            BBLogger.log("[Mic] imageio-ffmpeg not installed in plugin venv")
+        except Exception as e:
+            BBLogger.log(f"[Mic] imageio-ffmpeg lookup failed: {e}")
+
+        self._ffmpeg_unavailable = True
+        BBLogger.log(
+            "[Mic] No ffmpeg found — MP3 export disabled, using WAV. "
+            "Fix by setting FFMPEG_PATH env var, placing ffmpeg at "
+            f"{os.path.join(plugin_dir, 'deps', 'bin', platform_sub, exe)}, "
+            "or reinstalling the plugin venv so imageio-ffmpeg is available."
+        )
+
+    @staticmethod
+    def _safe_user() -> str:
+        try:
+            return getpass.getuser()
         except Exception:
-            pass
-
-    def _write_context_json(self, transcript, audio_path, timestamp, duration, language):
-        os.makedirs(self.context_dir, exist_ok=True)
-        digest_src = f"{timestamp}|{audio_path}|{transcript[:120]}".encode("utf-8")
-        digest = hashlib.md5(digest_src).hexdigest()[:10]
-        safe_ts = timestamp.replace(":", "-").replace(".", "-")
-        filename = f"mic_{safe_ts}_{digest}.json"
-        path = os.path.join(self.context_dir, filename)
-
-        payload = {
-            "type": "mic_transcription",
-            "connection_name": getattr(self, "connection_name", "") or "",
-            "timestamp": timestamp,
-            "duration_seconds": round(duration, 3),
-            "language": language or "",
-            "whisper_model": self.whisper_model_size,
-            "audio_path": audio_path,
-            "transcription": transcript,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        return path
+            return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
     def _get_audio_dir(self) -> str:
         try:
@@ -468,13 +538,6 @@ class SubjectiveMicDataSource(SubjectiveDataSource):
         return os.path.join(
             os.path.expanduser("~"), ".Subjective", "mic_audio",
         )
-
-    def _safe_remove(self, path: str):
-        try:
-            if path and os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            BBLogger.log(f"[Mic] Could not remove {path}: {e}")
 
     def handle_message(self, message: Any, files: list | None = None) -> Any:
         return {"status": "ready", "model": self.whisper_model_size}
